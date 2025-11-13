@@ -53,7 +53,7 @@ const uploadStreamingApp = async (fileLocation, apiKey, appName) => {
     // 1. Request signed URL
     let signedUrlData, signedUrl, version, fileName;
 
-    if (parseFloat(fileSizeGB) > 50) {
+    if (parseFloat(fileSizeGB) > 49.5) {
         console.log(`[Uploader] Large file detected (${fileSizeGB} GB). Using alternative upload method...`);
 
         // First, call the regular API to get the generated filename from response
@@ -90,10 +90,10 @@ const uploadStreamingApp = async (fileLocation, apiKey, appName) => {
                     httpsAgent
                 }
             );
-            if (!res.data?.data?.url || res.data.status !== "success") {
+            if (!res?.data?.data?.data?.url || res?.data?.data?.status !== "success") {
                 throw new Error("Failed to get alternative signed URL");
             }
-            return res.data.data;
+            return res.data.data.data;
         }, 10, 10000);
 
         signedUrl = altResponse.url;
