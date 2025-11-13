@@ -2,10 +2,80 @@ const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
 const https = require("https");
+const { URL } = require("url");
 const cliProgress = require("cli-progress");
 
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 const AGW_BASE_URL = "agw.eagle3dstreaming.com";
+
+/**
+ * Native HTTPS upload for very large files - more reliable than axios for 80GB+ files
+ */
+async function uploadWithNativeHttps(signedUrl, filePath, fileSizeBytes, progressBar) {
+    return new Promise((resolve, reject) => {
+        const parsedUrl = new URL(signedUrl);
+        let uploadedBytes = 0;
+        
+        const options = {
+            hostname: parsedUrl.hostname,
+            port: parsedUrl.port || 443,
+            path: parsedUrl.pathname + parsedUrl.search,
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/octet-stream',
+                'Content-Length': fileSizeBytes
+            },
+            // Enhanced options for large files
+            agent: new https.Agent({
+                keepAlive: true,
+                keepAliveMsecs: 30000,
+                maxSockets: 1,
+                maxFreeSockets: 1,
+                timeout: 0,
+                rejectUnauthorized: false
+            }),
+            timeout: 0 // No timeout
+        };
+
+        const req = https.request(options, (res) => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+                resolve();
+            } else {
+                reject(new Error(`Upload failed with status: ${res.statusCode}`));
+            }
+        });
+
+        req.on('error', (error) => {
+            reject(error);
+        });
+
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('Request timeout'));
+        });
+
+        // Create file stream with progress tracking
+        const fileStream = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 }); // 1MB chunks
+        
+        fileStream.on('data', (chunk) => {
+            uploadedBytes += chunk.length;
+            const uploadedMB = (uploadedBytes / (1024 ** 2)).toFixed(2);
+            const totalMB = (fileSizeBytes / (1024 ** 2)).toFixed(2);
+            progressBar.update(parseFloat(uploadedMB), { uploaded: uploadedMB, total: totalMB });
+        });
+
+        fileStream.on('error', (error) => {
+            req.destroy();
+            reject(error);
+        });
+
+        fileStream.on('end', () => {
+            req.end();
+        });
+
+        fileStream.pipe(req);
+    });
+}
 
 // Multi-bar for progress display
 const multiBar = new cliProgress.MultiBar({
@@ -35,16 +105,37 @@ const uploadStreamingApp = async (fileLocation, apiKey, appName) => {
         console.log(`[Uploader] ⚠️  Large file detected! Using alternative upload method for files > 50 GB`);
     }
 
-    // Retry wrapper
-    async function retry(fn, retries = 5, interval = 5000) {
+    // Enhanced retry wrapper with exponential backoff
+    async function retry(fn, retries = 5, baseInterval = 5000) {
         let lastError;
         for (let attempt = 1; attempt <= retries; attempt++) {
             try {
                 return await fn();
             } catch (err) {
                 lastError = err;
-                console.warn(`[Uploader] Attempt ${attempt} failed: ${err.message}`);
-                if (attempt < retries) await new Promise(res => setTimeout(res, interval));
+                const errorMsg = err.message || err.code || 'Unknown error';
+                console.warn(`[Uploader] Attempt ${attempt} failed: ${errorMsg}`);
+                
+                // Check for specific network errors that benefit from longer waits
+                const isNetworkError = errorMsg.includes('EPROTO') || 
+                                     errorMsg.includes('ECONNRESET') || 
+                                     errorMsg.includes('ETIMEDOUT') ||
+                                     errorMsg.includes('socket hang up');
+                
+                if (attempt < retries) {
+                    // Exponential backoff with jitter for network errors
+                    let waitTime = baseInterval * Math.pow(2, attempt - 1);
+                    if (isNetworkError) {
+                        waitTime *= 2; // Double wait time for network errors
+                        console.log(`[Uploader] Network error detected, waiting ${Math.round(waitTime/1000)}s before retry...`);
+                    }
+                    
+                    // Add jitter (±25% randomness)
+                    const jitter = waitTime * 0.25 * (Math.random() - 0.5);
+                    waitTime += jitter;
+                    
+                    await new Promise(res => setTimeout(res, waitTime));
+                }
             }
         }
         throw lastError;
@@ -119,30 +210,50 @@ const uploadStreamingApp = async (fileLocation, apiKey, appName) => {
     }
 
     // 2. Upload file with progress
-    await retry(async () => {
-        const progressBar = multiBar.create(fileSizeMB, 0, { file: path.basename(fileLocation), uploaded: '0.00', total: fileSizeMB });
+    const progressBar = multiBar.create(fileSizeMB, 0, { file: path.basename(fileLocation), uploaded: '0.00', total: fileSizeMB });
+    
+    if (parseFloat(fileSizeGB) > 50) {
+        // For very large files, use native HTTPS upload method
+        console.log(`[Uploader] Using native HTTPS upload for large file (${fileSizeGB} GB)...`);
+        console.log(`[Uploader] This may take a while for very large files. Please be patient...`);
+        
+        await retry(async () => {
+            try {
+                await uploadWithNativeHttps(signedUrl, fileLocation, fileSizeBytes, progressBar);
+                progressBar.update(fileSizeMB, { uploaded: fileSizeMB });
+                console.log(`[Uploader] Large file upload completed successfully!`);
+            } catch (error) {
+                console.warn(`[Uploader] Large file upload attempt failed: ${error.message}`);
+                throw error;
+            }
+        }, 15, 30000); // More retries with longer interval for large files
+        
+    } else {
+        // Standard upload for smaller files
+        await retry(async () => {
+            const fileStream = fs.createReadStream(fileLocation);
+            let uploadedBytes = 0;
 
-        const fileStream = fs.createReadStream(fileLocation);
-        let uploadedBytes = 0;
+            fileStream.on('data', chunk => {
+                uploadedBytes += chunk.length;
+                progressBar.update((uploadedBytes / (1024 ** 2)).toFixed(2), { uploaded: ((uploadedBytes / (1024 ** 2)).toFixed(2)) });
+            });
 
-        fileStream.on('data', chunk => {
-            uploadedBytes += chunk.length;
-            progressBar.update((uploadedBytes / (1024 ** 2)).toFixed(2), { uploaded: ((uploadedBytes / (1024 ** 2)).toFixed(2)) });
-        });
+            await axios.put(signedUrl, fileStream, {
+                headers: {
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": fileSizeBytes
+                },
+                maxContentLength: Infinity,
+                maxBodyLength: Infinity,
+                httpsAgent
+            });
 
-        await axios.put(signedUrl, fileStream, {
-            headers: {
-                "Content-Type": "application/octet-stream",
-                "Content-Length": fileSizeBytes
-            },
-            maxContentLength: Infinity,
-            maxBodyLength: Infinity,
-            httpsAgent
-        });
-
-        progressBar.update(fileSizeMB, { uploaded: fileSizeMB });
-        progressBar.stop();
-    }, 10, 15000);
+            progressBar.update(fileSizeMB, { uploaded: fileSizeMB });
+        }, 10, 15000);
+    }
+    
+    progressBar.stop();
 
     multiBar.stop();
 
