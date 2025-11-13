@@ -20,7 +20,7 @@ const multiBar = new cliProgress.MultiBar({
  * @param {string} apiKey - Eagle3D API key
  * @param {string} appName - App name
  */
-const uploadStreamingApp = async (fileLocation, apiKey, appName)  =>{
+const uploadStreamingApp = async (fileLocation, apiKey, appName) => {
     if (!fs.existsSync(fileLocation)) {
         throw new Error(`File not found: ${fileLocation}`);
     }
@@ -31,7 +31,9 @@ const uploadStreamingApp = async (fileLocation, apiKey, appName)  =>{
 
     console.log(`[Uploader] Preparing upload for ${appName} (${fileSizeMB} MB / ${fileSizeGB} GB)`);
 
-
+    if (parseFloat(fileSizeGB) > 50) {
+        console.log(`[Uploader] ⚠️  Large file detected! Using alternative upload method for files > 50 GB`);
+    }
 
     // Retry wrapper
     async function retry(fn, retries = 5, interval = 5000) {
@@ -49,21 +51,72 @@ const uploadStreamingApp = async (fileLocation, apiKey, appName)  =>{
     }
 
     // 1. Request signed URL
-    const signedUrlData = await retry(async () => {
-        const res = await axios.post(
-            "https://" + AGW_BASE_URL + "/api/v3/us/streamingapp-uv-signed-url-with-times",
-            { apiKey, appName, size: fileSizeGB },
-            { httpsAgent }
-        );
-        if (!res.data?.data?.data?.url || res.data.data.status !== "success") {
-            throw new Error("Failed to get signed URL");
-        }
-        return res.data.data.data;
-    }, 10, 10000);
+    let signedUrlData, signedUrl, version, fileName;
 
-    const signedUrl = signedUrlData.url;
-    const version = signedUrlData.filepath.split("/")[2].split(".")[0];
-    console.log(`[Uploader] Got signed URL. Version: ${version}`);
+    if (parseFloat(fileSizeGB) > 50) {
+        console.log(`[Uploader] Large file detected (${fileSizeGB} GB). Using alternative upload method...`);
+
+        // First, call the regular API to get the generated filename from response
+        const initialResponse = await retry(async () => {
+            const res = await axios.post(
+                "https://" + AGW_BASE_URL + "/api/v3/us/streamingapp-uv-signed-url-with-times",
+                { apiKey, appName, size: fileSizeGB },
+                { httpsAgent }
+            );
+            if (!res.data?.data?.data?.filepath || res.data.data.status !== "success") {
+                throw new Error("Failed to get initial file info");
+            }
+            return res.data.data;
+        }, 10, 10000);
+
+        // Extract the generated filename from the response filepath
+        fileName = path.basename(initialResponse.data.filepath);
+        // Extract version from filename (e.g., "uv-1-1763049350431.zip" -> "1763049350431")
+        const fileNameParts = fileName.split(".")[0].split("-");
+        version = fileNameParts.length >= 3 ? fileNameParts.slice(2).join("-") : fileNameParts[fileNameParts.length - 1];
+        console.log(`[Uploader] Got generated filename from first API: ${fileName}, Version: ${version}`);
+
+        // Now call the alternative signed URL API using the filename from first API response
+        const altResponse = await retry(async () => {
+            const res = await axios.post(
+                "https://" + AGW_BASE_URL + "/api/v3/us/streamingapp-alt-signed-url-filename-wise",
+                {
+                    apiKey,
+                    appName,
+                    size: fileSizeGB,
+                    fileName: fileName
+                },
+                {
+                    httpsAgent
+                }
+            );
+            if (!res.data?.data?.url || res.data.status !== "success") {
+                throw new Error("Failed to get alternative signed URL");
+            }
+            return res.data.data;
+        }, 10, 10000);
+
+        signedUrl = altResponse.url;
+        console.log(`[Uploader] Got alternative signed URL for large file upload`);
+
+    } else {
+        // Standard upload for files <= 50 GB
+        signedUrlData = await retry(async () => {
+            const res = await axios.post(
+                "https://" + AGW_BASE_URL + "/api/v3/us/streamingapp-uv-signed-url-with-times",
+                { apiKey, appName, size: fileSizeGB },
+                { httpsAgent }
+            );
+            if (!res.data?.data?.data?.url || res.data.data.status !== "success") {
+                throw new Error("Failed to get signed URL");
+            }
+            return res.data.data.data;
+        }, 10, 10000);
+
+        signedUrl = signedUrlData.url;
+        version = signedUrlData.filepath.split("/")[2].split(".")[0];
+        console.log(`[Uploader] Got signed URL. Version: ${version}`);
+    }
 
     // 2. Upload file with progress
     await retry(async () => {
